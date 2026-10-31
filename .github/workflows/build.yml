@@ -140,13 +140,25 @@ jobs:
               ).map { collapse(it) }
 
               // Kelime bu ifadeyle BAŞLIYORSA engellenir (sex, sexi, sexy, seks, seksi ...)
-              private val STARTS: List<String> = listOf("sex", "seks").map { collapse(it) }
+              private val STARTS: List<String> = listOf(
+                  "sex", "seks", "azgin", "vajina", "amcik", "yarak", "penis", "penjs",
+                  "sevisme", "lezbiyen"
+              ).map { collapse(it) }
 
               // Tam kelime olarak eşleşirse engellenir
-              private val WORDS: Set<String> = setOf("nsfw", "bdsm", "cam4", "tube8").map { collapse(it) }.toSet()
+              private val WORDS: Set<String> = setOf(
+                  "nsfw", "bdsm", "cam4", "tube8", "anal", "lez"
+              ).map { collapse(it) }.toSet()
+
+              // Sadece yazılan metinde (arama kutusu) tam kelime olarak engellenen kısa kelimeler.
+              // Şu an boş.
+              private val TYPED_ONLY: Set<String> = emptySet()
 
               // Türkçe karakterli, tam kelime eşleşmesi (ö korunur, "got" gibi kelimeler etkilenmez)
-              private val RAW_WORDS: Set<String> = setOf("göt", "götü", "götünü", "götüne", "götten")
+              // Tekrarlı yazımlar da yakalanır: ggöt, göttt
+              private val RAW_WORDS: Set<String> = setOf(
+                  "göt", "götü", "götünü", "götüne", "götten"
+              ).map { collapse(it) }.toSet()
 
               private val WS = Regex("\\s+")
               private val NON_ALNUM = Regex("[^a-z0-9]+")
@@ -184,12 +196,12 @@ jobs:
               }
 
               /** Arama kutusu / adres çubuğu metni için. */
-              fun isBlockedText(raw: String?): Boolean {
+              fun isBlockedText(raw: String?, typed: Boolean = true): Boolean {
                   if (raw.isNullOrBlank()) return false
                   val text = if (raw.length > 500) raw.substring(0, 500) else raw
 
                   for (t in text.lowercase(TR).split(NON_LETTER)) {
-                      if (t in RAW_WORDS) return true
+                      if (t.isNotEmpty() && collapse(t) in RAW_WORDS) return true
                   }
 
                   val norm = normalize(text)
@@ -209,6 +221,7 @@ jobs:
                       if (XXX.matches(t)) return true
                       val c = collapse(t)
                       if (c in WORDS) return true
+                      if (typed && c in TYPED_ONLY) return true
                       for (s in STARTS) {
                           if (c.startsWith(s)) return true
                       }
@@ -221,7 +234,7 @@ jobs:
                   val h = host.lowercase(Locale.ROOT).trimEnd('.')
                   if (h.isEmpty()) return false
                   if (h.endsWith(".xxx") || h.endsWith(".adult") || h.endsWith(".porn") || h.endsWith(".sex")) return true
-                  return isBlockedText(h.replace('.', ' ').replace('-', ' ').replace('_', ' '))
+                  return isBlockedText(h.replace('.', ' ').replace('-', ' ').replace('_', ' '), false)
               }
           }
           EOF
