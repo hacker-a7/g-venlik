@@ -1,0 +1,878 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Create project files
+        run: |
+          mkdir -p proj/app
+          cat > proj/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.guvenlik.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.guvenlik.app"
+                  minSdk = 26
+                  targetSdk = 33
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+          mkdir -p proj/app/src/main
+          cat > proj/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".GuardVpnService"
+                      android:exported="false"
+                      android:permission="android.permission.BIND_VPN_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                  </service>
+
+                  <service
+                      android:name=".GuardAccessibilityService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+
+                  <receiver
+                      android:name=".BootReceiver"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p proj/app/src/main/java/com/guvenlik/app
+          cat > proj/app/src/main/java/com/guvenlik/app/Blocklist.kt <<'EOF'
+          package com.guvenlik.app
+
+          import java.util.Locale
+
+          /**
+           * Kelime ve alan adı kontrolü.
+           * Listeleri aşağıdan istediğin gibi genişletebilirsin.
+           * Eşleştirme öncesi metin: küçük harfe çevrilir, Türkçe karakterler sadeleşir,
+           * "p0rn0" gibi yazımlar düzeltilir ve art arda tekrar eden harfler teke indirilir
+           * (poorno -> porno, sikkiiş -> sikis).
+           */
+          object Blocklist {
+              private val TR = Locale("tr", "TR")
+
+              // Kelimenin herhangi bir yerinde geçerse engellenir
+              private val CONTAINS: List<String> = listOf(
+                  "porn", "sikis", "sikik", "hentai", "erotik", "erotic",
+                  "xvideos", "xnxx", "xhamster", "redtube", "youporn", "spankbang",
+                  "chaturbate", "stripchat", "bongacams", "livejasmin", "brazzers",
+                  "eporner", "motherless", "thumbzilla", "tnaflix", "hqporner",
+                  "fapello", "onlyfans", "rule34", "nhentai", "camsoda"
+              ).map { collapse(it) }
+
+              // Kelime bu ifadeyle BAŞLIYORSA engellenir (sex, sexi, sexy, seks, seksi ...)
+              private val STARTS: List<String> = listOf("sex", "seks").map { collapse(it) }
+
+              // Tam kelime olarak eşleşirse engellenir
+              private val WORDS: Set<String> = setOf("nsfw", "bdsm", "cam4", "tube8").map { collapse(it) }.toSet()
+
+              // Türkçe karakterli, tam kelime eşleşmesi (ö korunur, "got" gibi kelimeler etkilenmez)
+              private val RAW_WORDS: Set<String> = setOf("göt", "götü", "götünü", "götüne", "götten")
+
+              private val WS = Regex("\\s+")
+              private val NON_ALNUM = Regex("[^a-z0-9]+")
+              private val NON_LETTER = Regex("[^\\p{L}]+")
+              private val XXX = Regex("^x{3,}$")
+
+              private fun normalize(s: String): String {
+                  val sb = StringBuilder(s.length)
+                  for (ch in s.lowercase(TR)) {
+                      val m = when (ch) {
+                          'ı' -> 'i'
+                          'ö' -> 'o'
+                          'ü' -> 'u'
+                          'ş' -> 's'
+                          'ç' -> 'c'
+                          'ğ' -> 'g'
+                          '0' -> 'o'
+                          '1' -> 'i'
+                          '3' -> 'e'
+                          '@' -> 'a'
+                          '$' -> 's'
+                          else -> ch
+                      }
+                      sb.append(m)
+                  }
+                  return sb.toString()
+              }
+
+              private fun collapse(s: String): String {
+                  val sb = StringBuilder(s.length)
+                  for (ch in s) {
+                      if (sb.isEmpty() || sb[sb.length - 1] != ch) sb.append(ch)
+                  }
+                  return sb.toString()
+              }
+
+              /** Arama kutusu / adres çubuğu metni için. */
+              fun isBlockedText(raw: String?): Boolean {
+                  if (raw.isNullOrBlank()) return false
+                  val text = if (raw.length > 500) raw.substring(0, 500) else raw
+
+                  for (t in text.lowercase(TR).split(NON_LETTER)) {
+                      if (t in RAW_WORDS) return true
+                  }
+
+                  val norm = normalize(text)
+
+                  // Boşlukla ayrılmış parçalar: "p.o.r.n.o" gibi araya işaret konan yazımları yakalar
+                  for (ws in norm.split(WS)) {
+                      val joined = collapse(ws.filter { it.isLetterOrDigit() })
+                      if (joined.isEmpty()) continue
+                      for (k in CONTAINS) {
+                          if (joined.contains(k)) return true
+                      }
+                  }
+
+                  // Harf/rakam dışındakilerle bölünmüş parçalar
+                  for (t in norm.split(NON_ALNUM)) {
+                      if (t.isEmpty()) continue
+                      if (XXX.matches(t)) return true
+                      val c = collapse(t)
+                      if (c in WORDS) return true
+                      for (s in STARTS) {
+                          if (c.startsWith(s)) return true
+                      }
+                  }
+                  return false
+              }
+
+              /** DNS sorgusundaki alan adı için. */
+              fun isBlockedHost(host: String): Boolean {
+                  val h = host.lowercase(Locale.ROOT).trimEnd('.')
+                  if (h.isEmpty()) return false
+                  if (h.endsWith(".xxx") || h.endsWith(".adult") || h.endsWith(".porn") || h.endsWith(".sex")) return true
+                  return isBlockedText(h.replace('.', ' ').replace('-', ' ').replace('_', ' '))
+              }
+          }
+          EOF
+          mkdir -p proj/app/src/main/java/com/guvenlik/app
+          cat > proj/app/src/main/java/com/guvenlik/app/BootReceiver.kt <<'EOF'
+          package com.guvenlik.app
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.net.VpnService
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) {
+                  if (Prefs.isActive(c) && VpnService.prepare(c) == null) {
+                      c.startForegroundService(Intent(c, GuardVpnService::class.java))
+                  }
+              }
+          }
+          EOF
+          mkdir -p proj/app/src/main/java/com/guvenlik/app
+          cat > proj/app/src/main/java/com/guvenlik/app/GuardAccessibilityService.kt <<'EOF'
+          package com.guvenlik.app
+
+          import android.accessibilityservice.AccessibilityService
+          import android.os.Bundle
+          import android.os.SystemClock
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          /**
+           * Arama kutusuna / adres çubuğuna yazılan kelimeleri izler.
+           * VPN, Tor veya özel DNS kullanılsa bile çalışır çünkü ekrandaki yazıya bakar.
+           */
+          class GuardAccessibilityService : AccessibilityService() {
+
+              private var lastScan = 0L
+              private var lastBlock = 0L
+
+              // Yazı kontrolü sadece bu uygulamalarda yapılır (Chrome, Google, Tor)
+              private val targets = setOf(
+                  "com.android.chrome",
+                  "com.chrome.beta",
+                  "com.google.android.googlequicksearchbox",
+                  "org.torproject.torbrowser",
+                  "org.torproject.torbrowser_alpha"
+              )
+
+              private val urlHints =listOf("url", "search", "omnibox", "location_bar", "address", "query")
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+                  if (e == null || !Prefs.isActive(this)) return
+                  val pkg = e.packageName?.toString() ?: return
+                  if (pkg !in targets) return
+
+                  if (e.eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
+                      val t = e.text?.joinToString(" ") ?: ""
+                      if (Blocklist.isBlockedText(t)) {
+                          block(e.source)
+                          return
+                      }
+                  }
+
+                  val now = SystemClock.elapsedRealtime()
+                  if (now - lastScan < 300) return
+                  lastScan = now
+
+                  val root = rootInActiveWindow ?: return
+                  scan(root, 0, intArrayOf(0))
+              }
+
+              private fun scan(node: AccessibilityNodeInfo?, depth: Int, count: IntArray): Boolean {
+                  if (node == null || depth > 25 || count[0] > 600) return false
+                  count[0]++
+
+                  val id = node.viewIdResourceName?.lowercase() ?: ""
+                  val relevant = node.isEditable || urlHints.any { id.contains(it) }
+                  if (relevant) {
+                      val t = node.text?.toString()
+                      if (t != null && Blocklist.isBlockedText(t)) {
+                          block(node)
+                          return true
+                      }
+                  }
+                  for (i in 0 until node.childCount) {
+                      if (scan(node.getChild(i), depth + 1, count)) return true
+                  }
+                  return false
+              }
+
+              private fun block(node: AccessibilityNodeInfo?) {
+                  val now = SystemClock.elapsedRealtime()
+                  if (now - lastBlock < 1500) return
+                  lastBlock = now
+                  try {
+                      if (node != null && node.isEditable) {
+                          val args = Bundle()
+                          args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
+                          node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                      }
+                  } catch (_: Exception) {
+                  }
+                  performGlobalAction(GLOBAL_ACTION_HOME)
+              }
+
+              override fun onInterrupt() {}
+          }
+          EOF
+          mkdir -p proj/app/src/main/java/com/guvenlik/app
+          cat > proj/app/src/main/java/com/guvenlik/app/GuardVpnService.kt <<'EOF'
+          package com.guvenlik.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.content.Intent
+          import android.net.VpnService
+          import android.os.ParcelFileDescriptor
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+          import java.util.concurrent.ExecutorService
+          import java.util.concurrent.Executors
+
+          /**
+           * Yalnızca DNS trafiğini yakalayan yerel VPN.
+           * - Engelli alan adları için "yok" cevabı döner.
+           * - Diğer sorgular yetişkin içerik filtreli DNS'e iletilir.
+           * Bağlantı hangi ağdan (Wi-Fi, mobil veri) gelirse gelsin çalışır.
+           */
+          class GuardVpnService : VpnService() {
+
+              companion object {
+                  const val ACTION_STOP = "com.guvenlik.app.STOP"
+                  private const val CHANNEL = "g"
+                  private const val FAKE_DNS = "10.111.0.2"
+                  private val UPSTREAM = arrayOf("185.228.168.10", "185.228.169.11")
+              }
+
+              private var tun: ParcelFileDescriptor? = null
+              @Volatile private var running = false
+              private var worker: Thread? = null
+              private val pool: ExecutorService = Executors.newFixedThreadPool(8)
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  showNotification()
+                  if (intent?.action == ACTION_STOP || !Prefs.isActive(this)) {
+                      shutdown()
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  if (!running) startVpn()
+                  return START_STICKY
+              }
+
+              override fun onRevoke() {
+                  shutdown()
+                  super.onRevoke()
+              }
+
+              override fun onDestroy() {
+                  shutdown()
+                  super.onDestroy()
+              }
+
+              private fun showNotification() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(CHANNEL, "Güvenlik", NotificationManager.IMPORTANCE_MIN)
+                  )
+                  val n = Notification.Builder(this, CHANNEL)
+                      .setContentTitle("Güvenlik")
+                      .setContentText("Açık")
+                      .setSmallIcon(R.drawable.ic_shield)
+                      .setOngoing(true)
+                      .build()
+                  startForeground(1, n)
+              }
+
+              private fun startVpn() {
+                  val builder = Builder()
+                      .setSession("Güvenlik")
+                      .addAddress("10.111.0.1", 32)
+                      .addDnsServer(FAKE_DNS)
+                      .addRoute(FAKE_DNS, 32)
+                      .setBlocking(true)
+
+                  val fd = try {
+                      builder.establish()
+                  } catch (e: Exception) {
+                      null
+                  }
+                  if (fd == null) {
+                      stopSelf()
+                      return
+                  }
+                  tun = fd
+                  running = true
+                  worker = Thread { loop(fd) }.also { it.start() }
+              }
+
+              private fun shutdown() {
+                  running = false
+                  try {
+                      tun?.close()
+                  } catch (_: Exception) {
+                  }
+                  tun = null
+                  worker?.interrupt()
+                  worker = null
+              }
+
+              private fun loop(fd: ParcelFileDescriptor) {
+                  val input = FileInputStream(fd.fileDescriptor)
+                  val output = FileOutputStream(fd.fileDescriptor)
+                  val buf = ByteArray(32767)
+                  try {
+                      while (running) {
+                          val n = input.read(buf)
+                          if (n < 0) break
+                          if (n < 28) continue
+                          handle(buf.copyOf(n), output)
+                      }
+                  } catch (_: Exception) {
+                  }
+              }
+
+              private fun handle(p: ByteArray, out: FileOutputStream) {
+                  if ((p[0].toInt() shr 4) != 4) return
+                  val ihl = (p[0].toInt() and 0x0F) * 4
+                  if (p[9].toInt() != 17 || p.size < ihl + 8) return
+
+                  val srcPort = ((p[ihl].toInt() and 0xFF) shl 8) or (p[ihl + 1].toInt() and 0xFF)
+                  val dstPort = ((p[ihl + 2].toInt() and 0xFF) shl 8) or (p[ihl + 3].toInt() and 0xFF)
+                  if (dstPort != 53) return
+
+                  val total = ((p[2].toInt() and 0xFF) shl 8) or (p[3].toInt() and 0xFF)
+                  val end = minOf(total, p.size)
+                  if (end <= ihl + 8) return
+
+                  val srcIp = p.copyOfRange(12, 16)
+                  val dstIp = p.copyOfRange(16, 20)
+                  val query = p.copyOfRange(ihl + 8, end)
+
+                  val q = parseQuestion(query)
+                  if (q != null && Blocklist.isBlockedHost(q.first)) {
+                      val resp = nxdomain(query, q.second)
+                      write(out, buildUdp(dstIp, srcIp, 53, srcPort, resp))
+                      return
+                  }
+
+                  pool.execute {
+                      val resp = forward(query) ?: return@execute
+                      write(out, buildUdp(dstIp, srcIp, 53, srcPort, resp))
+                  }
+              }
+
+              /** Sorgudaki alan adını ve sorunun bittiği konumu döner. */
+              private fun parseQuestion(d: ByteArray): Pair<String, Int>? {
+                  if (d.size < 17) return null
+                  var i = 12
+                  val sb = StringBuilder()
+                  while (i < d.size) {
+                      val len = d[i].toInt() and 0xFF
+                      if (len == 0) {
+                          val qEnd = i + 1 + 4
+                          if (qEnd > d.size) return null
+                          return Pair(sb.toString(), qEnd)
+                      }
+                      if ((len and 0xC0) != 0 || i + 1 + len > d.size) return null
+                      if (sb.isNotEmpty()) sb.append('.')
+                      sb.append(String(d, i + 1, len, Charsets.ISO_8859_1))
+                      i += 1 + len
+                  }
+                  return null
+              }
+
+              private fun nxdomain(query: ByteArray, qEnd: Int): ByteArray {
+                  val r = query.copyOfRange(0, qEnd)
+                  r[2] = (0x80 or (query[2].toInt() and 0x01)).toByte() // QR=1, RD korunur
+                  r[3] = 0x83.toByte() // RA + NXDOMAIN
+                  r[4] = 0
+                  r[5] = 1
+                  for (k in 6..11) r[k] = 0
+                  return r
+              }
+
+              private fun forward(query: ByteArray): ByteArray? {
+                  for (host in UPSTREAM) {
+                      val s = DatagramSocket()
+                      try {
+                          protect(s)
+                          s.soTimeout = 3500
+                          s.send(DatagramPacket(query, query.size, InetAddress.getByName(host), 53))
+                          val buf = ByteArray(4096)
+                          val r = DatagramPacket(buf, buf.size)
+                          s.receive(r)
+                          return buf.copyOf(r.length)
+                      } catch (_: Exception) {
+                      } finally {
+                          s.close()
+                      }
+                  }
+                  return null
+              }
+
+              private fun write(out: FileOutputStream, pkt: ByteArray) {
+                  synchronized(out) {
+                      try {
+                          out.write(pkt)
+                      } catch (_: Exception) {
+                      }
+                  }
+              }
+
+              private fun buildUdp(
+                  srcIp: ByteArray, dstIp: ByteArray, srcPort: Int, dstPort: Int, payload: ByteArray
+              ): ByteArray {
+                  val total = 20 + 8 + payload.size
+                  val p = ByteArray(total)
+                  p[0] = 0x45
+                  p[2] = (total shr 8).toByte()
+                  p[3] = total.toByte()
+                  p[6] = 0x40
+                  p[8] = 64
+                  p[9] = 17
+                  System.arraycopy(srcIp, 0, p, 12, 4)
+                  System.arraycopy(dstIp, 0, p, 16, 4)
+                  val cs = checksum(p, 0, 20)
+                  p[10] = (cs shr 8).toByte()
+                  p[11] = cs.toByte()
+                  p[20] = (srcPort shr 8).toByte()
+                  p[21] = srcPort.toByte()
+                  p[22] = (dstPort shr 8).toByte()
+                  p[23] = dstPort.toByte()
+                  val ulen = 8 + payload.size
+                  p[24] = (ulen shr 8).toByte()
+                  p[25] = ulen.toByte()
+                  System.arraycopy(payload, 0, p, 28, payload.size)
+                  return p
+              }
+
+              private fun checksum(b: ByteArray, off: Int, len: Int): Int {
+                  var sum = 0L
+                  var i = off
+                  while (i < off + len - 1) {
+                      sum += (((b[i].toInt() and 0xFF) shl 8) or (b[i + 1].toInt() and 0xFF)).toLong()
+                      i += 2
+                  }
+                  while ((sum shr 16) != 0L) {
+                      sum = (sum and 0xFFFF) + (sum shr 16)
+                  }
+                  return (sum.inv() and 0xFFFF).toInt()
+              }
+          }
+          EOF
+          mkdir -p proj/app/src/main/java/com/guvenlik/app
+          cat > proj/app/src/main/java/com/guvenlik/app/MainActivity.kt <<'EOF'
+          package com.guvenlik.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.net.VpnService
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private val reqVpn = 100
+              private var pendingStart = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.parseColor("#F2F6FC"))
+                      setPadding(dp(32), dp(32), dp(32), dp(32))
+                  }
+
+                  val logo = ImageView(this).apply {
+                      setImageResource(R.drawable.ic_shield)
+                      layoutParams = LinearLayout.LayoutParams(dp(160), dp(160)).apply {
+                          bottomMargin = dp(48)
+                      }
+                  }
+
+                  root.addView(logo)
+                  root.addView(makeButton(getString(R.string.start), true) { startFlow() })
+                  root.addView(makeButton(getString(R.string.stop), false) { confirmStop() })
+                  setContentView(root)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (pendingStart && isAccessibilityOn()) {
+                      pendingStart = false
+                      startFlow()
+                  }
+              }
+
+              private fun startFlow() {
+                  if (!isAccessibilityOn()) {
+                      pendingStart = true
+                      Toast.makeText(this, R.string.enable_hint, Toast.LENGTH_LONG).show()
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      return
+                  }
+                  val prep = VpnService.prepare(this)
+                  if (prep != null) {
+                      startActivityForResult(prep, reqVpn)
+                  } else {
+                      launchService()
+                  }
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == reqVpn && resultCode == RESULT_OK) launchService()
+              }
+
+              private fun launchService() {
+                  Prefs.setActive(this, true)
+                  startForegroundService(Intent(this, GuardVpnService::class.java))
+              }
+
+              private fun confirmStop() {
+                  AlertDialog.Builder(this)
+                      .setMessage(getString(R.string.confirm_message))
+                      .setPositiveButton(R.string.stop) { _, _ -> doStop() }
+                      .setNegativeButton(R.string.cancel, null)
+                      .show()
+              }
+
+              private fun doStop() {
+                  Prefs.setActive(this, false)
+                  startService(Intent(this, GuardVpnService::class.java).setAction(GuardVpnService.ACTION_STOP))
+              }
+
+              private fun isAccessibilityOn(): Boolean {
+                  val cn = ComponentName(this, GuardAccessibilityService::class.java)
+                  val enabled = Settings.Secure.getString(
+                      contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                  ) ?: return false
+                  return enabled.split(':').any {
+                      it.equals(cn.flattenToString(), true) || it.equals(cn.flattenToShortString(), true)
+                  }
+              }
+
+              private fun makeButton(label: String, filled: Boolean, onClick: () -> Unit): Button {
+                  val blue = Color.parseColor("#1565C0")
+                  return Button(this).apply {
+                      setText(label)
+                      isAllCaps = false
+                      textSize = 18f
+                      setTextColor(if (filled) Color.WHITE else blue)
+                      background = GradientDrawable().apply {
+                          cornerRadius = dp(28).toFloat()
+                          if (filled) {
+                              setColor(blue)
+                          } else {
+                              setColor(Color.WHITE)
+                              setStroke(dp(2), blue)
+                          }
+                      }
+                      layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56)).apply {
+                          topMargin = dp(16)
+                      }
+                      setOnClickListener { onClick() }
+                  }
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+          }
+          EOF
+          mkdir -p proj/app/src/main/java/com/guvenlik/app
+          cat > proj/app/src/main/java/com/guvenlik/app/Prefs.kt <<'EOF'
+          package com.guvenlik.app
+
+          import android.content.Context
+
+          object Prefs {
+              private fun sp(c: Context) = c.getSharedPreferences("g", Context.MODE_PRIVATE)
+
+              fun isActive(c: Context): Boolean = sp(c).getBoolean("a", false)
+
+              fun setActive(c: Context, v: Boolean) {
+                  sp(c).edit().putBoolean("a", v).apply()
+              }
+          }
+          EOF
+          mkdir -p proj/app/src/main/res/drawable
+          cat > proj/app/src/main/res/drawable/ic_launcher_foreground.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <group
+                  android:scaleX="2"
+                  android:scaleY="2"
+                  android:translateX="30"
+                  android:translateY="30">
+                  <path
+                      android:fillColor="#FFFFFF"
+                      android:pathData="M12,1L3,5v6c0,5.55 3.84,10.74 9,12 5.16,-1.26 9,-6.45 9,-12V5l-9,-4z" />
+                  <path
+                      android:fillColor="#1976D2"
+                      android:pathData="M10.5,16.2 L6.8,12.5 L8.2,11.1 L10.5,13.4 L15.8,8.1 L17.2,9.5 z" />
+              </group>
+          </vector>
+          EOF
+          mkdir -p proj/app/src/main/res/drawable
+          cat > proj/app/src/main/res/drawable/ic_shield.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="160dp"
+              android:height="160dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#1565C0"
+                  android:pathData="M12,1L3,5v6c0,5.55 3.84,10.74 9,12 5.16,-1.26 9,-6.45 9,-12V5l-9,-4z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M10.5,16.2 L6.8,12.5 L8.2,11.1 L10.5,13.4 L15.8,8.1 L17.2,9.5 z" />
+          </vector>
+          EOF
+          mkdir -p proj/app/src/main/res/mipmap-anydpi-v26
+          cat > proj/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icon_bg" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF
+          mkdir -p proj/app/src/main/res/mipmap-anydpi-v26
+          cat > proj/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icon_bg" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF
+          mkdir -p proj/app/src/main/res/values
+          cat > proj/app/src/main/res/values/colors.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="bg">#F2F6FC</color>
+              <color name="blue">#1565C0</color>
+              <color name="icon_bg">#1976D2</color>
+          </resources>
+          EOF
+          mkdir -p proj/app/src/main/res/values
+          cat > proj/app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Güvenlik</string>
+              <string name="start">Başlat</string>
+              <string name="stop">Kapat</string>
+              <string name="cancel">Vazgeç</string>
+              <string name="enable_hint">Güvenlik\'i açın</string>
+              <!-- Kapat'a basınca çıkan uyarı cümlesi. Kendi cümleni buraya yaz. -->
+              <string name="confirm_message">Allah dostlarıda hata yapar lakin ısrar etmezler, Eğer ısrar ediyorsan Allah senden yüz çevirmiştir.</string>
+          </resources>
+          EOF
+          mkdir -p proj/app/src/main/res/values
+          cat > proj/app/src/main/res/values/styles.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:statusBarColor">@color/bg</item>
+                  <item name="android:navigationBarColor">@color/bg</item>
+                  <item name="android:windowLightStatusBar">true</item>
+              </style>
+          </resources>
+          EOF
+          mkdir -p proj/app/src/main/res/xml
+          cat > proj/app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeViewTextChanged|typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/app_name"
+              android:notificationTimeout="100" />
+          EOF
+          mkdir -p proj/
+          cat > proj/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          mkdir -p proj/
+          cat > proj/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          kotlin.code.style=official
+          EOF
+          mkdir -p proj/
+          cat > proj/settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Guvenlik"
+          include(":app")
+          EOF
+
+      - name: Build debug APK
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Guvenlik-APK
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
